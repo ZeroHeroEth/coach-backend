@@ -43,12 +43,11 @@ app.post('/profile', requireAuth, async (req, res) => {
     .select()
     .single();
   if (error) {
-    console.error('Profile upsert error:', error);  // ← Add this
+    console.error('Profile upsert error:', error);
     return res.status(500).json({ error });
   }
   res.json(data);
 });
-
 
 // ── Memory log ─────────────────────────────────────────────────────────────
 app.get('/memory', requireAuth, async (req, res) => {
@@ -63,7 +62,7 @@ app.get('/memory', requireAuth, async (req, res) => {
 });
 
 app.post('/memory', requireAuth, async (req, res) => {
-  const { facts } = req.body; // array of strings
+  const { facts } = req.body;
   if (!facts?.length) return res.json([]);
   const date = new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
   const rows = facts.map(text => ({ user_id: req.user.id, text, date }));
@@ -90,7 +89,6 @@ app.get('/routines', requireAuth, async (req, res) => {
     .select('*')
     .eq('user_id', req.user.id);
   if (error) return res.status(500).json({ error });
-  // Return as object keyed by type
   const result = {};
   (data || []).forEach(r => { result[r.type] = { sections: r.sections, source: r.source, updatedAt: r.updated_at }; });
   res.json(result);
@@ -119,9 +117,20 @@ app.delete('/routines/:type', requireAuth, async (req, res) => {
   res.json({ success: true });
 });
 
+// ── Conversations ──────────────────────────────────────────────────────────
+app.get('/conversations', requireAuth, async (req, res) => {
+  const { data, error } = await supabase
+    .from('conversations')
+    .select('*')
+    .eq('user_id', req.user.id)
+    .order('created_at', { ascending: true });
+  if (error) return res.status(500).json({ error });
+  res.json(data || []);
+});
+
 // ── Chat ───────────────────────────────────────────────────────────────────
 app.post('/chat', requireAuth, async (req, res) => {
-  const { messages } = req.body;
+  const { messages, userMessage } = req.body;
   if (!messages?.length) return res.status(400).json({ error: 'No messages' });
 
   // Load full context from DB
@@ -152,21 +161,27 @@ app.post('/chat', requireAuth, async (req, res) => {
   const anthropicData = await anthropicRes.json();
   const reply = anthropicData.content?.[0]?.text || 'Something went wrong.';
 
-  // Fire background jobs (don't await)
+  // Save conversation to DB
+  const lastUserMessage = messages[messages.length - 1]?.content || '';
+  await supabase.from('conversations').insert([
+    { user_id: req.user.id, role: 'user', content: lastUserMessage },
+    { user_id: req.user.id, role: 'assistant', content: reply }
+  ]);
+
+  // Fire background jobs
   const transcript = [...messages, { role: 'assistant', content: reply }]
     .map(m => `${m.role === 'user' ? (profile?.name || 'User') : 'Coach'}: ${m.content}`)
     .join('\n');
-  runBackgroundJobs(req.user.id, reply, transcript, profile?.name);
+  runBackgroundJobs(req.user.id, reply, transcript);
 
   res.json({ reply });
 });
 
 // ── Background jobs ────────────────────────────────────────────────────────
-async function runBackgroundJobs(userId, reply, transcript, userName) {
+async function runBackgroundJobs(userId, reply, transcript) {
   await Promise.allSettled([
-    extractAndSaveMemory(userId, transcript, userName),
-    extractAndSaveRoutines(userId, reply),
-    checkCommitment(reply) // returned value used client-side, just validate here
+    extractAndSaveMemory(userId, transcript),
+    extractAndSaveRoutines(userId, reply)
   ]);
 }
 
@@ -184,7 +199,7 @@ async function callClaude(prompt, maxTokens = 300) {
   return data.content?.[0]?.text?.replace(/```json|```/g, '').trim() || '';
 }
 
-async function extractAndSaveMemory(userId, transcript, userName) {
+async function extractAndSaveMemory(userId, transcript) {
   const prompt = `Extract NEW facts from this coaching conversation worth remembering about the user. Only genuinely new info.
 Examples: new PRs, injuries, diet changes, goal shifts, mood/energy, life context.
 JSON only: {"facts":["..."]} or {"facts":[]}. No preamble, no markdown.
@@ -224,20 +239,6 @@ ${reply}`;
       }
     }
   } catch(e) {}
-}
-
-async function checkCommitment(reply) {
-  if (!/every morning|every evening|each day|daily|tonight|tomorrow|at \d|pm|am|wake up|go to bed|schedule|commit|don't skip|start monday|this week/i.test(reply)) return null;
-  const prompt = `Did the coach set a specific schedule or recurring commitment?
-If yes, write a short reminder prompt (e.g. "Want me to remind you to train at 7am each morning?").
-JSON only: {"prompt":"..."} or {"prompt":""}. No markdown.
-
-MESSAGE:
-${reply}`;
-  try {
-    const raw = await callClaude(prompt, 100);
-    return JSON.parse(raw);
-  } catch(e) { return null; }
 }
 
 // ── System prompt builder ──────────────────────────────────────────────────
