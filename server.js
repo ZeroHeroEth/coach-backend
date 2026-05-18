@@ -1,6 +1,8 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
@@ -12,25 +14,91 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY
 );
 
+// Simple in-memory session store (token -> user_id)
+// For production this should be Redis or a DB table
+const sessions = new Map();
+
+function generateToken() {
+  return crypto.randomBytes(32).toString('hex');
+}
+
 // ── Auth middleware ────────────────────────────────────────────────────────
-async function requireAuth(req, res, next) {
+function requireAuth(req, res, next) {
   const token = req.headers.authorization?.replace('Bearer ', '');
   if (!token) return res.status(401).json({ error: 'No token' });
-  const { data: { user }, error } = await supabase.auth.getUser(token);
-  if (error || !user) return res.status(401).json({ error: 'Invalid token' });
-  req.user = user;
+  const userId = sessions.get(token);
+  if (!userId) return res.status(401).json({ error: 'Invalid or expired session' });
+  req.userId = userId;
   next();
 }
 
 // ── Health check ───────────────────────────────────────────────────────────
 app.get('/', (req, res) => res.json({ status: 'Coach backend running' }));
 
+// ── Auth routes ────────────────────────────────────────────────────────────
+app.post('/auth/signup', async (req, res) => {
+  const { username, pin } = req.body;
+  if (!username || !pin) return res.status(400).json({ error: 'Username and PIN required' });
+  if (pin.length !== 4 || !/^\d{4}$/.test(pin)) return res.status(400).json({ error: 'PIN must be 4 digits' });
+  if (username.length < 2) return res.status(400).json({ error: 'Username too short' });
+
+  // Check if username taken
+  const { data: existing } = await supabase
+    .from('users')
+    .select('id')
+    .eq('username', username.toLowerCase())
+    .single();
+  if (existing) return res.status(409).json({ error: 'Username already taken' });
+
+  const pin_hash = await bcrypt.hash(pin, 10);
+  const { data, error } = await supabase
+    .from('users')
+    .insert({ username: username.toLowerCase(), pin_hash })
+    .select()
+    .single();
+
+  if (error) {
+    console.error('Signup error:', error);
+    return res.status(500).json({ error: 'Failed to create account' });
+  }
+
+  const token = generateToken();
+  sessions.set(token, data.id);
+  res.json({ token, userId: data.id, username: data.username });
+});
+
+app.post('/auth/signin', async (req, res) => {
+  const { username, pin } = req.body;
+  if (!username || !pin) return res.status(400).json({ error: 'Username and PIN required' });
+
+  const { data: user, error } = await supabase
+    .from('users')
+    .select('*')
+    .eq('username', username.toLowerCase())
+    .single();
+
+  if (error || !user) return res.status(401).json({ error: 'Username not found' });
+
+  const valid = await bcrypt.compare(pin, user.pin_hash);
+  if (!valid) return res.status(401).json({ error: 'Wrong PIN' });
+
+  const token = generateToken();
+  sessions.set(token, user.id);
+  res.json({ token, userId: user.id, username: user.username });
+});
+
+app.post('/auth/signout', requireAuth, (req, res) => {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  sessions.delete(token);
+  res.json({ success: true });
+});
+
 // ── Profile ────────────────────────────────────────────────────────────────
 app.get('/profile', requireAuth, async (req, res) => {
   const { data, error } = await supabase
     .from('profiles')
     .select('*')
-    .eq('id', req.user.id)
+    .eq('id', req.userId)
     .single();
   if (error && error.code !== 'PGRST116') return res.status(500).json({ error });
   res.json(data || null);
@@ -39,7 +107,7 @@ app.get('/profile', requireAuth, async (req, res) => {
 app.post('/profile', requireAuth, async (req, res) => {
   const { data, error } = await supabase
     .from('profiles')
-    .upsert({ id: req.user.id, ...req.body })
+    .upsert({ id: req.userId, ...req.body })
     .select()
     .single();
   if (error) {
@@ -54,32 +122,11 @@ app.get('/memory', requireAuth, async (req, res) => {
   const { data, error } = await supabase
     .from('memory_log')
     .select('*')
-    .eq('user_id', req.user.id)
+    .eq('user_id', req.userId)
     .order('created_at', { ascending: false })
     .limit(40);
   if (error) return res.status(500).json({ error });
   res.json(data || []);
-});
-
-app.post('/memory', requireAuth, async (req, res) => {
-  const { facts } = req.body;
-  if (!facts?.length) return res.json([]);
-  const date = new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-  const rows = facts.map(text => ({ user_id: req.user.id, text, date }));
-  const { data, error } = await supabase.from('memory_log').insert(rows).select();
-  if (error) return res.status(500).json({ error });
-
-  // Keep only the 40 most recent
-  const { data: all } = await supabase
-    .from('memory_log')
-    .select('id, created_at')
-    .eq('user_id', req.user.id)
-    .order('created_at', { ascending: false });
-  if (all && all.length > 40) {
-    const toDelete = all.slice(40).map(r => r.id);
-    await supabase.from('memory_log').delete().in('id', toDelete);
-  }
-  res.json(data);
 });
 
 // ── Routines ───────────────────────────────────────────────────────────────
@@ -87,10 +134,12 @@ app.get('/routines', requireAuth, async (req, res) => {
   const { data, error } = await supabase
     .from('routines')
     .select('*')
-    .eq('user_id', req.user.id);
+    .eq('user_id', req.userId);
   if (error) return res.status(500).json({ error });
   const result = {};
-  (data || []).forEach(r => { result[r.type] = { sections: r.sections, source: r.source, updatedAt: r.updated_at }; });
+  (data || []).forEach(r => {
+    result[r.type] = { sections: r.sections, source: r.source, updatedAt: r.updated_at };
+  });
   res.json(result);
 });
 
@@ -99,11 +148,16 @@ app.post('/routines', requireAuth, async (req, res) => {
   const updated_at = new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
   const { data, error } = await supabase
     .from('routines')
-    .upsert({ user_id: req.user.id, type, sections, source: source || 'coach', updated_at },
-             { onConflict: 'user_id,type' })
+    .upsert(
+      { user_id: req.userId, type, sections, source: source || 'coach', updated_at },
+      { onConflict: 'user_id,type' }
+    )
     .select()
     .single();
-  if (error) return res.status(500).json({ error });
+  if (error) {
+    console.error('Routine upsert error:', error);
+    return res.status(500).json({ error });
+  }
   res.json(data);
 });
 
@@ -111,7 +165,7 @@ app.delete('/routines/:type', requireAuth, async (req, res) => {
   const { error } = await supabase
     .from('routines')
     .delete()
-    .eq('user_id', req.user.id)
+    .eq('user_id', req.userId)
     .eq('type', req.params.type);
   if (error) return res.status(500).json({ error });
   res.json({ success: true });
@@ -122,7 +176,7 @@ app.get('/conversations', requireAuth, async (req, res) => {
   const { data, error } = await supabase
     .from('conversations')
     .select('*')
-    .eq('user_id', req.user.id)
+    .eq('user_id', req.userId)
     .order('created_at', { ascending: true });
   if (error) return res.status(500).json({ error });
   res.json(data || []);
@@ -130,14 +184,13 @@ app.get('/conversations', requireAuth, async (req, res) => {
 
 // ── Chat ───────────────────────────────────────────────────────────────────
 app.post('/chat', requireAuth, async (req, res) => {
-  const { messages, userMessage } = req.body;
+  const { messages } = req.body;
   if (!messages?.length) return res.status(400).json({ error: 'No messages' });
 
-  // Load full context from DB
   const [profileRes, memoryRes, routinesRes] = await Promise.all([
-    supabase.from('profiles').select('*').eq('id', req.user.id).single(),
-    supabase.from('memory_log').select('*').eq('user_id', req.user.id).order('created_at', { ascending: false }).limit(40),
-    supabase.from('routines').select('*').eq('user_id', req.user.id)
+    supabase.from('profiles').select('*').eq('id', req.userId).single(),
+    supabase.from('memory_log').select('*').eq('user_id', req.userId).order('created_at', { ascending: false }).limit(40),
+    supabase.from('routines').select('*').eq('user_id', req.userId)
   ]);
 
   const profile = profileRes.data;
@@ -147,7 +200,6 @@ app.post('/chat', requireAuth, async (req, res) => {
 
   const systemPrompt = buildSystemPrompt(profile, memory, routinesByType);
 
-  // Call Anthropic
   const anthropicRes = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
@@ -161,18 +213,18 @@ app.post('/chat', requireAuth, async (req, res) => {
   const anthropicData = await anthropicRes.json();
   const reply = anthropicData.content?.[0]?.text || 'Something went wrong.';
 
-  // Save conversation to DB
+  // Save conversation
   const lastUserMessage = messages[messages.length - 1]?.content || '';
   await supabase.from('conversations').insert([
-    { user_id: req.user.id, role: 'user', content: lastUserMessage },
-    { user_id: req.user.id, role: 'assistant', content: reply }
+    { user_id: req.userId, role: 'user', content: lastUserMessage },
+    { user_id: req.userId, role: 'assistant', content: reply }
   ]);
 
-  // Fire background jobs
+  // Background jobs
   const transcript = [...messages, { role: 'assistant', content: reply }]
     .map(m => `${m.role === 'user' ? (profile?.name || 'User') : 'Coach'}: ${m.content}`)
     .join('\n');
-  runBackgroundJobs(req.user.id, reply, transcript);
+  runBackgroundJobs(req.userId, reply, transcript);
 
   res.json({ reply });
 });
@@ -193,7 +245,11 @@ async function callClaude(prompt, maxTokens = 300) {
       'x-api-key': process.env.ANTHROPIC_API_KEY,
       'anthropic-version': '2023-06-01'
     },
-    body: JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens: maxTokens, messages: [{ role: 'user', content: prompt }] })
+    body: JSON.stringify({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: maxTokens,
+      messages: [{ role: 'user', content: prompt }]
+    })
   });
   const data = await res.json();
   return data.content?.[0]?.text?.replace(/```json|```/g, '').trim() || '';
@@ -212,8 +268,15 @@ ${transcript}`;
     if (facts?.length) {
       const date = new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
       await supabase.from('memory_log').insert(facts.map(text => ({ user_id: userId, text, date })));
+      // Keep only 40 most recent
+      const { data: all } = await supabase
+        .from('memory_log').select('id').eq('user_id', userId)
+        .order('created_at', { ascending: false });
+      if (all && all.length > 40) {
+        await supabase.from('memory_log').delete().in('id', all.slice(40).map(r => r.id));
+      }
     }
-  } catch(e) {}
+  } catch(e) { console.error('Memory extraction error:', e); }
 }
 
 async function extractAndSaveRoutines(userId, reply) {
@@ -230,21 +293,25 @@ ${reply}`;
   try {
     const raw = await callClaude(prompt, 800);
     const parsed = JSON.parse(raw);
+    if (!Object.keys(parsed).length) return;
     const date = new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
     for (const [type, val] of Object.entries(parsed)) {
       if (val?.sections?.length) {
-        await supabase.from('routines')
-          .upsert({ user_id: userId, type, sections: val.sections, source: 'coach', updated_at: date },
-                  { onConflict: 'user_id,type' });
+        const { error } = await supabase.from('routines')
+          .upsert(
+            { user_id: userId, type, sections: val.sections, source: 'coach', updated_at: date },
+            { onConflict: 'user_id,type' }
+          );
+        if (error) console.error(`Routine save error (${type}):`, error);
+        else console.log(`Routine saved: ${type}`);
       }
     }
-  } catch(e) {}
+  } catch(e) { console.error('Routine extraction error:', e); }
 }
 
-// ── System prompt builder ──────────────────────────────────────────────────
+// ── System prompt ──────────────────────────────────────────────────────────
 function buildSystemPrompt(profile, memory, routines) {
   if (!profile) return 'You are a personal coach. Ask the user to complete their profile setup.';
-
   const h = parseInt(profile.height), ft = Math.floor(h/12), inch = h%12;
   const memBlock = memory.length
     ? '\nMEMORY LOG:\n' + memory.map(m => `- [${m.date}] ${m.text}`).join('\n') : '';
