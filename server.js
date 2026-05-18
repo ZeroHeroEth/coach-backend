@@ -42,9 +42,13 @@ app.post('/profile', requireAuth, async (req, res) => {
     .upsert({ id: req.user.id, ...req.body })
     .select()
     .single();
-  if (error) return res.status(500).json({ error });
+  if (error) {
+    console.error('Profile upsert error:', error);  // ← Add this
+    return res.status(500).json({ error });
+  }
   res.json(data);
 });
+
 
 // ── Memory log ─────────────────────────────────────────────────────────────
 app.get('/memory', requireAuth, async (req, res) => {
