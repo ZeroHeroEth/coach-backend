@@ -124,12 +124,11 @@ Write a message that:
     const routineNames = routines.map(r => r.type).join(', ');
     const memoryText = memory.map(m => m.text.toLowerCase()).join(' ');
 
-    // Determine which topic hasn't been covered yet
     const topics = [
       { key: 'diet', keywords: ['breakfast', 'lunch', 'dinner', 'eat', 'food', 'macro', 'calori', 'diet', 'meal', 'nutrition'], question: 'Ask one focused question about their typical daily eating habits or how they approach nutrition.' },
-      { key: 'history', keywords: ['year', 'been training', 'started', 'experience', 'background', 'worked before', 'used to'], question: 'Ask one focused question about their training background or history — how long they've been training or what's worked for them before.' },
+      { key: 'history', keywords: ['year', 'been training', 'started', 'experience', 'background', 'worked before', 'used to'], question: 'Ask one focused question about their training background — how long they have been training or what has worked for them before.' },
       { key: 'schedule', keywords: ['morning', 'evening', 'time', 'schedule', 'busy', 'work', 'sleep', 'night', 'routine'], question: 'Ask one focused question about their daily schedule — when they prefer to train or what their typical day looks like.' },
-      { key: 'motivation', keywords: ['motivat', 'goal', 'driving', 'why', 'event', 'deadline', 'reason'], question: 'Ask one focused question about what's driving them right now — what they're chasing or why this goal matters to them.' },
+      { key: 'motivation', keywords: ['motivat', 'goal', 'driving', 'why', 'event', 'deadline', 'reason'], question: 'Ask one focused question about what is driving them right now — what they are chasing or why this goal matters to them.' },
       { key: 'equipment', keywords: ['gym', 'home', 'equipment', 'dumbbell', 'barbell', 'machine', 'train at'], question: 'Ask one focused question about where they train and what equipment they have access to.' },
     ];
 
@@ -138,26 +137,28 @@ Write a message that:
       ? uncovered.question
       : 'Ask one focused question based on their recent activity or progress toward their goal.';
 
-    prompt = \`You are Coach, a personal AI coach. This user is returning after more than 24 hours away. Open the conversation proactively with a check-in message.
+    const recentMemory = memory.slice(0, 3).map(m => '- ' + m.text).join('\n') || 'Nothing recent';
+
+    prompt = `You are Coach, a personal AI coach. This user is returning after more than 24 hours away. Open the conversation proactively with a check-in message.
 
 USER PROFILE:
-- Name: \${profile.name} | Goal: \${profile.goal} | Trains: \${profile.freq}/week
+- Name: ${profile.name} | Goal: ${profile.goal} | Trains: ${profile.freq}/week
 
-TODAY: \${today}
-ACTIVE ROUTINES: \${routineNames || 'None yet'}
+TODAY: ${today}
+ACTIVE ROUTINES: ${routineNames || 'None yet'}
 RECENT MEMORY:
-\${memory.slice(0,3).map(m => \`- \${m.text}\`).join('\n') || 'Nothing recent'}
+${recentMemory}
 
 Write a check-in message that:
-1. Feels natural, not robotic — like a coach who's been thinking about their client
+1. Feels natural, not robotic — like a coach who has been thinking about their client
 2. Optionally references something specific from memory or routines if relevant
-3. \${focusInstruction}
+3. ${focusInstruction}
 4. Keep it under 70 words
-5. Do NOT use "I'll be honest", "Here's the reality", or filler openers
-6. Do NOT start with "Hey" or "Hi \${profile.name}" every time — vary the opener\`;
+5. Do NOT use "I will be honest", "Here is the reality", or filler openers
+6. Do NOT start with "Hey" or "Hi ${profile.name}" every time — vary the opener`;
   }
 
-  try {
+    try {
     const raw = await callClaude(prompt, 300);
     // Save opener as assistant message in conversations
     await supabase.from('conversations').insert({ user_id: req.userId, role: 'assistant', content: raw });
