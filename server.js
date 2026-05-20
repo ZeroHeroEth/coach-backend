@@ -351,7 +351,12 @@ function buildSystemPrompt(profile, memory, routines, complianceStr = '') {
         `${k.toUpperCase()} (updated ${r.updated_at}):\n` + r.sections.map(s => `  ${s.title}:\n${s.items.map(i => `    - ${i}`).join('\n')}`).join('\n')
       ).join('\n\n') : '';
 
+  const now = new Date();
+  const currentDate = now.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+
   return `You are a sharp, direct, and knowledgeable personal coach. NOT a generic AI — this person's dedicated coach with full context.
+
+TODAY: ${currentDate}
 
 USER PROFILE:
 - Name: ${profile.name} | Age: ${profile.age} | Sex: ${profile.sex}
