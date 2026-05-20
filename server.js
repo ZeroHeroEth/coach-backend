@@ -66,9 +66,11 @@ app.post('/auth/signin', async (req, res) => {
   const needsCheckin = hoursSince !== null && hoursSince >= 24;
   const needsOnboarding = profile && !profile.onboarding_complete;
 
+  const flaggedItems = needsCheckin ? await getFlaggedItems(user.id, profile?.last_seen) : [];
+
   const token = generateToken();
   sessions.set(token, user.id);
-  res.json({ token, userId: user.id, username: user.username, needsCheckin, needsOnboarding });
+  res.json({ token, userId: user.id, username: user.username, needsCheckin, needsOnboarding, flaggedItems });
 });
 
 app.post('/auth/signout', requireAuth, async (req, res) => {
@@ -87,7 +89,7 @@ app.post('/heartbeat', requireAuth, async (req, res) => {
 
 // ── Session opener — generates Coach's first message ──────────────────────
 app.get('/session-opener', requireAuth, async (req, res) => {
-  const { type } = req.query; // 'onboarding' or 'checkin'
+  const { type, flagged } = req.query; // 'onboarding' or 'checkin'
 
   const [profileRes, memoryRes, routinesRes] = await Promise.all([
     supabase.from('profiles').select('*').eq('id', req.userId).single(),
@@ -133,9 +135,21 @@ Write a message that:
     ];
 
     const uncovered = topics.find(t => !t.keywords.some(k => memoryText.includes(k)));
-    const focusInstruction = uncovered
-      ? uncovered.question
-      : 'Ask one focused question based on their recent activity or progress toward their goal.';
+
+    // Parse flagged items from query param
+    let parsedFlagged = [];
+    try { parsedFlagged = flagged ? JSON.parse(decodeURIComponent(flagged)) : []; } catch(e) {}
+
+    let focusInstruction;
+    if (parsedFlagged.length > 0) {
+      const f = parsedFlagged[0];
+      const dayName = f.day.charAt(0).toUpperCase() + f.day.slice(1);
+      focusInstruction = `The user had a ${f.routine_type} session scheduled for ${dayName} (${f.section_title}) that passed since they last used the app. Ask how it went — naturally, not like a system check.`;
+    } else if (uncovered) {
+      focusInstruction = uncovered.question;
+    } else {
+      focusInstruction = 'Ask one focused question based on their recent activity or progress toward their goal.';
+    }
 
     const recentMemory = memory.slice(0, 3).map(m => '- ' + m.text).join('\n') || 'Nothing recent';
 
@@ -230,10 +244,11 @@ app.post('/chat', requireAuth, async (req, res) => {
   const { messages } = req.body;
   if (!messages?.length) return res.status(400).json({ error: 'No messages' });
 
-  const [profileRes, memoryRes, routinesRes] = await Promise.all([
+  const [profileRes, memoryRes, routinesRes, complianceStr] = await Promise.all([
     supabase.from('profiles').select('*').eq('id', req.userId).single(),
     supabase.from('memory_log').select('*').eq('user_id', req.userId).order('created_at', { ascending: false }).limit(40),
-    supabase.from('routines').select('*').eq('user_id', req.userId)
+    supabase.from('routines').select('*').eq('user_id', req.userId),
+    getComplianceSummary(req.userId)
   ]);
 
   const profile = profileRes.data;
@@ -241,7 +256,7 @@ app.post('/chat', requireAuth, async (req, res) => {
   const routinesByType = {};
   (routinesRes.data || []).forEach(r => { routinesByType[r.type] = r; });
 
-  const systemPrompt = buildSystemPrompt(profile, memory, routinesByType);
+  const systemPrompt = buildSystemPrompt(profile, memory, routinesByType, complianceStr);
 
   const anthropicRes = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
@@ -327,7 +342,7 @@ ${reply}`;
 }
 
 // ── System prompt ──────────────────────────────────────────────────────────
-function buildSystemPrompt(profile, memory, routines) {
+function buildSystemPrompt(profile, memory, routines, complianceStr = '') {
   if (!profile) return 'You are a personal coach. Ask the user to complete their profile setup.';
   const h = parseInt(profile.height), ft = Math.floor(h/12), inch = h%12;
   const memBlock = memory.length ? '\nMEMORY LOG:\n' + memory.map(m => `- [${m.date}] ${m.text}`).join('\n') : '';
@@ -344,7 +359,7 @@ USER PROFILE:
 - Goal: ${profile.goal} | Diet: ${profile.diet}
 - Injuries: ${profile.injuries} | Trains: ${profile.freq}/week
 - Notes: ${profile.notes || 'None'}
-${memBlock}${routineBlock}
+${memBlock}${routineBlock}${complianceStr}
 
 COACHING STYLE:
 - Direct and specific. No filler. No generic advice.
@@ -357,6 +372,90 @@ BANNED PHRASES (never use):
 "I'll be honest", "Here's the reality", "Let's be real", "Real talk", "I have to say",
 "At the end of the day", "The truth is", "Look," as opener, any confession/revelation framing.
 Just say the thing. No wind-up.`;
+}
+
+
+// ── Completions ────────────────────────────────────────────────────────────
+
+// Get completions for a date range
+app.get('/completions', requireAuth, async (req, res) => {
+  const { start, end } = req.query;
+  let query = supabase.from('completions').select('*').eq('user_id', req.userId).order('date', { ascending: true });
+  if (start) query = query.gte('date', start);
+  if (end) query = query.lte('date', end);
+  const { data, error } = await query;
+  if (error) return res.status(500).json({ error });
+  res.json(data || []);
+});
+
+// Upsert a completion
+app.post('/completions', requireAuth, async (req, res) => {
+  const { date, routine_type, section_title, status, note } = req.body;
+  if (!date || !routine_type || !section_title) return res.status(400).json({ error: 'Missing required fields' });
+  const { data, error } = await supabase
+    .from('completions')
+    .upsert(
+      { user_id: req.userId, date, routine_type, section_title, status: status || 'pending', note: note || null },
+      { onConflict: 'user_id,date,routine_type,section_title' }
+    )
+    .select().single();
+  if (error) { console.error('Completion upsert error:', error); return res.status(500).json({ error }); }
+  res.json(data);
+});
+
+// Get compliance summary for system prompt (last 7 days)
+async function getComplianceSummary(userId) {
+  const end = new Date();
+  const start = new Date();
+  start.setDate(start.getDate() - 7);
+  const { data } = await supabase
+    .from('completions')
+    .select('*')
+    .eq('user_id', userId)
+    .gte('date', start.toISOString().split('T')[0])
+    .lte('date', end.toISOString().split('T')[0])
+    .order('date', { ascending: false });
+  if (!data || !data.length) return '';
+  const lines = data.map(c => {
+    const day = new Date(c.date + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
+    const icon = c.status === 'completed' ? 'completed' : c.status === 'skipped' ? 'skipped' : 'pending';
+    const note = c.note ? ' (' + c.note + ')' : '';
+    return '- ' + day + ' ' + c.routine_type + ': ' + icon + note;
+  });
+  return '\nCOMPLIANCE LOG (last 7 days):\n' + lines.join('\n');
+}
+
+// Check for flagged items since last_seen
+async function getFlaggedItems(userId, lastSeen) {
+  if (!lastSeen) return [];
+  const { data: routines } = await supabase.from('routines').select('*').eq('user_id', userId);
+  if (!routines || !routines.length) return [];
+  const now = new Date();
+  const last = new Date(lastSeen);
+  const flagged = [];
+  const days = ['sunday','monday','tuesday','wednesday','thursday','friday','saturday'];
+  for (const routine of routines) {
+    for (const section of (routine.sections || [])) {
+      const titleLower = section.title.toLowerCase();
+      const dayMatch = days.find(d => titleLower.includes(d));
+      if (!dayMatch) continue;
+      const dayIndex = days.indexOf(dayMatch);
+      const check = new Date(now);
+      while (check.getDay() !== dayIndex) check.setDate(check.getDate() - 1);
+      if (check > last && check <= now) {
+        const dateStr = check.toISOString().split('T')[0];
+        const { data: existing } = await supabase
+          .from('completions').select('id')
+          .eq('user_id', userId).eq('date', dateStr)
+          .eq('routine_type', routine.type).eq('section_title', section.title)
+          .single();
+        if (!existing) {
+          flagged.push({ date: dateStr, day: dayMatch, routine_type: routine.type, section_title: section.title });
+        }
+      }
+    }
+  }
+  return flagged;
 }
 
 const PORT = process.env.PORT || 3000;
