@@ -317,10 +317,18 @@ ${transcript}`;
 async function extractAndSaveRoutines(userId, reply) {
   if (!/workout|meal plan|diet plan|sleep|routine|schedule|monday|tuesday|wednesday|sets|reps|cardio|breakfast|lunch|dinner/i.test(reply)) return;
   const prompt = `Extract structured routine data from this coach message.
+
+CRITICAL TITLE FORMAT RULES:
+- Workout sections MUST use day names: "Monday — Push", "Wednesday — Circuit", "Friday — Legs"
+- Diet sections with specific days MUST use: "Sunday — Meal Prep", "Monday-Friday — Lunch", "Daily — Breakfast"
+- Diet sections without specific days use category: "Breakfast", "Lunch", "Dinner", "Snacks"
+- Sleep sections use: "Schedule", "Wind-down Routine"
+- Always include the day name in the title if a specific day or range is mentioned
+
 Format (only include keys present):
-{"workout":{"sections":[{"title":"Day/focus","items":["Exercise sets/reps"]}]},
- "diet":{"sections":[{"title":"Category","items":["Meal"]}]},
- "sleep":{"sections":[{"title":"Schedule","items":["Time/habit"]}]}}
+{"workout":{"sections":[{"title":"Monday — Push","items":["Bench press 4x8","OHP 3x10"]}]},
+ "diet":{"sections":[{"title":"Sunday — Meal Prep","items":["90 min burrito bowl prep"]},{"title":"Monday-Friday — Lunch","items":["Burrito bowl"]}]},
+ "sleep":{"sections":[{"title":"Schedule","items":["Lights out 10:30pm","Wake 6:30am"]}]}}
 If no routine: {}. JSON only, no markdown.
 
 MESSAGE:
