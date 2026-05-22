@@ -59,18 +59,29 @@ app.post('/auth/signin', async (req, res) => {
   const valid = await bcrypt.compare(pin, user.pin_hash);
   if (!valid) return res.status(401).json({ error: 'Wrong PIN' });
 
-  // Check last_seen before updating it
-  const { data: profile } = await supabase.from('profiles').select('last_seen, onboarding_complete').eq('id', user.id).single();
+  // Check session thresholds before updating last_seen
+  const { data: profile } = await supabase.from('profiles').select('last_seen, last_checkin, onboarding_complete').eq('id', user.id).single();
+  const now = Date.now();
   const lastSeen = profile?.last_seen ? new Date(profile.last_seen) : null;
-  const hoursSince = lastSeen ? (Date.now() - lastSeen.getTime()) / (1000 * 60 * 60) : null;
-  const needsCheckin = hoursSince !== null && hoursSince >= 24;
+  const lastCheckin = profile?.last_checkin ? new Date(profile.last_checkin) : null;
+  const minutesSinceSeen = lastSeen ? (now - lastSeen.getTime()) / (1000 * 60) : null;
+  const hoursSinceCheckin = lastCheckin ? (now - lastCheckin.getTime()) / (1000 * 60 * 60) : null;
   const needsOnboarding = profile && !profile.onboarding_complete;
 
-  const flaggedItems = needsCheckin ? await getFlaggedItems(user.id, profile?.last_seen) : [];
+  const flaggedItems = await getFlaggedItems(user.id, profile?.last_seen);
+
+  let openerType = null;
+  if (flaggedItems.length > 0) {
+    openerType = 'checkin';
+  } else if (hoursSinceCheckin === null || hoursSinceCheckin >= 6) {
+    openerType = 'checkin';
+  } else if (minutesSinceSeen === null || minutesSinceSeen >= 30) {
+    openerType = 'greeting';
+  }
 
   const token = generateToken();
   sessions.set(token, user.id);
-  res.json({ token, userId: user.id, username: user.username, needsCheckin, needsOnboarding, flaggedItems });
+  res.json({ token, userId: user.id, username: user.username, openerType, needsOnboarding, flaggedItems });
 });
 
 app.post('/auth/signout', requireAuth, async (req, res) => {
@@ -89,7 +100,7 @@ app.post('/heartbeat', requireAuth, async (req, res) => {
 
 // ── Session opener — generates Coach's first message ──────────────────────
 app.get('/session-opener', requireAuth, async (req, res) => {
-  const { type, flagged } = req.query; // 'onboarding' or 'checkin'
+  const { type, flagged } = req.query; // 'onboarding', 'checkin', or 'greeting'
 
   const [profileRes, memoryRes, routinesRes] = await Promise.all([
     supabase.from('profiles').select('*').eq('id', req.userId).single(),
@@ -101,9 +112,27 @@ app.get('/session-opener', requireAuth, async (req, res) => {
   const memory = memoryRes.data || [];
   const routines = routinesRes.data || [];
 
+  const timeOfDay = (() => {
+    const h = new Date().getHours();
+    if (h < 12) return 'morning';
+    if (h < 17) return 'afternoon';
+    return 'evening';
+  })();
+
   let prompt;
 
-  if (type === 'onboarding') {
+  if (type === 'greeting') {
+    const recentMemory = memory.slice(0, 2).map(m => '- ' + m.text).join('\n') || 'Nothing recent';
+    prompt = `You are Coach, a personal AI coach. The user just opened the app after a short break (30+ minutes but less than 6 hours).
+
+USER: ${profile.name} | Goal: ${profile.goal} | Time of day: ${timeOfDay}
+RECENT MEMORY:
+${recentMemory}
+
+Write a brief warm greeting under 30 words. Vary your style — sometimes just acknowledge them, sometimes ask something light and casual like how they're feeling or how their day is going. Don't ask about workout or diet specifically — save that for full check-ins. Natural, not robotic.
+BANNED: "I'll be honest", "Here's the reality", filler openers.`;
+
+  } else if (type === 'onboarding') {
     prompt = `You are Coach, a personal AI coach. A new user just completed their profile setup. Write a warm, direct intro message to kick off your first conversation with them.
 
 USER PROFILE:
@@ -136,7 +165,6 @@ Write a message that:
 
     const uncovered = topics.find(t => !t.keywords.some(k => memoryText.includes(k)));
 
-    // Parse flagged items from query param
     let parsedFlagged = [];
     try { parsedFlagged = flagged ? JSON.parse(decodeURIComponent(flagged)) : []; } catch(e) {}
 
@@ -153,7 +181,7 @@ Write a message that:
 
     const recentMemory = memory.slice(0, 3).map(m => '- ' + m.text).join('\n') || 'Nothing recent';
 
-    prompt = `You are Coach, a personal AI coach. This user is returning after more than 24 hours away. Open the conversation proactively with a check-in message.
+    prompt = `You are Coach, a personal AI coach. This user is returning after more than 6 hours away. Open the conversation proactively with a check-in message.
 
 USER PROFILE:
 - Name: ${profile.name} | Goal: ${profile.goal} | Trains: ${profile.freq}/week
@@ -172,13 +200,17 @@ Write a check-in message that:
 6. Do NOT start with "Hey" or "Hi ${profile.name}" every time — vary the opener`;
   }
 
-    try {
+  try {
     const raw = await callClaude(prompt, 300);
-    // Save opener as assistant message in conversations
-    await supabase.from('conversations').insert({ user_id: req.userId, role: 'assistant', content: raw });
-    // Mark onboarding complete if this was the onboarding opener
+    // Save opener to conversations (not for greetings — keep those light)
+    if (type !== 'greeting') {
+      await supabase.from('conversations').insert({ user_id: req.userId, role: 'assistant', content: raw });
+    }
+    // Update timestamps
     if (type === 'onboarding') {
       await supabase.from('profiles').update({ onboarding_complete: true, last_seen: new Date().toISOString() }).eq('id', req.userId);
+    } else if (type === 'checkin') {
+      await supabase.from('profiles').update({ last_checkin: new Date().toISOString() }).eq('id', req.userId);
     }
     res.json({ message: raw });
   } catch(e) {
@@ -191,16 +223,30 @@ Write a check-in message that:
 app.get('/session-status', requireAuth, async (req, res) => {
   const { data: profile } = await supabase
     .from('profiles')
-    .select('last_seen, onboarding_complete')
+    .select('last_seen, last_checkin, onboarding_complete')
     .eq('id', req.userId)
     .single();
 
+  const now = Date.now();
   const lastSeen = profile?.last_seen ? new Date(profile.last_seen) : null;
-  const hoursSince = lastSeen ? (Date.now() - lastSeen.getTime()) / (1000 * 60 * 60) : null;
-  const needsCheckin = hoursSince !== null && hoursSince >= 24;
-  const flaggedItems = needsCheckin ? await getFlaggedItems(req.userId, profile?.last_seen) : [];
+  const lastCheckin = profile?.last_checkin ? new Date(profile.last_checkin) : null;
 
-  res.json({ needsCheckin, flaggedItems });
+  const minutesSinceSeen = lastSeen ? (now - lastSeen.getTime()) / (1000 * 60) : null;
+  const hoursSinceCheckin = lastCheckin ? (now - lastCheckin.getTime()) / (1000 * 60 * 60) : null;
+
+  // Flagged compliance items always take priority
+  const flaggedItems = await getFlaggedItems(req.userId, profile?.last_seen);
+
+  let openerType = null;
+  if (flaggedItems.length > 0) {
+    openerType = 'checkin'; // compliance flag — full check-in
+  } else if (hoursSinceCheckin === null || hoursSinceCheckin >= 6) {
+    openerType = 'checkin'; // 6+ hours since last full check-in
+  } else if (minutesSinceSeen === null || minutesSinceSeen >= 30) {
+    openerType = 'greeting'; // 30+ minutes — warm greeting
+  }
+
+  res.json({ openerType, flaggedItems });
 });
 
 // ── Profile ────────────────────────────────────────────────────────────────
