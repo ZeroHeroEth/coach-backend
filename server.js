@@ -187,6 +187,22 @@ Write a check-in message that:
   }
 });
 
+// ── Session status — for returning users with stored token ─────────────────
+app.get('/session-status', requireAuth, async (req, res) => {
+  const { data: profile } = await supabase
+    .from('profiles')
+    .select('last_seen, onboarding_complete')
+    .eq('id', req.userId)
+    .single();
+
+  const lastSeen = profile?.last_seen ? new Date(profile.last_seen) : null;
+  const hoursSince = lastSeen ? (Date.now() - lastSeen.getTime()) / (1000 * 60 * 60) : null;
+  const needsCheckin = hoursSince !== null && hoursSince >= 24;
+  const flaggedItems = needsCheckin ? await getFlaggedItems(req.userId, profile?.last_seen) : [];
+
+  res.json({ needsCheckin, flaggedItems });
+});
+
 // ── Profile ────────────────────────────────────────────────────────────────
 app.get('/profile', requireAuth, async (req, res) => {
   const { data, error } = await supabase.from('profiles').select('*').eq('id', req.userId).single();
