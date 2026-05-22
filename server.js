@@ -269,6 +269,17 @@ app.get('/memory', requireAuth, async (req, res) => {
   res.json(data || []);
 });
 
+// ── Permanent memory ──────────────────────────────────────────────────────
+app.get('/memory/permanent', requireAuth, async (req, res) => {
+  const { data, error } = await supabase
+    .from('memory_permanent')
+    .select('*')
+    .eq('user_id', req.userId)
+    .order('updated_at', { ascending: false });
+  if (error) return res.status(500).json({ error });
+  res.json(data || []);
+});
+
 // ── Routines ───────────────────────────────────────────────────────────────
 app.get('/routines', requireAuth, async (req, res) => {
   const { data, error } = await supabase.from('routines').select('*').eq('user_id', req.userId);
@@ -306,19 +317,21 @@ app.post('/chat', requireAuth, async (req, res) => {
   const { messages } = req.body;
   if (!messages?.length) return res.status(400).json({ error: 'No messages' });
 
-  const [profileRes, memoryRes, routinesRes, complianceStr] = await Promise.all([
+  const [profileRes, memoryRes, permanentMemRes, routinesRes, complianceStr] = await Promise.all([
     supabase.from('profiles').select('*').eq('id', req.userId).single(),
     supabase.from('memory_log').select('*').eq('user_id', req.userId).order('created_at', { ascending: false }).limit(40),
+    supabase.from('memory_permanent').select('*').eq('user_id', req.userId).order('updated_at', { ascending: false }),
     supabase.from('routines').select('*').eq('user_id', req.userId),
     getComplianceSummary(req.userId)
   ]);
 
   const profile = profileRes.data;
   const memory = memoryRes.data || [];
+  const permanentMemory = permanentMemRes.data || [];
   const routinesByType = {};
   (routinesRes.data || []).forEach(r => { routinesByType[r.type] = r; });
 
-  const systemPrompt = buildSystemPrompt(profile, memory, routinesByType, complianceStr);
+  const systemPrompt = buildSystemPrompt(profile, memory, permanentMemory, routinesByType, complianceStr);
 
   const anthropicRes = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
@@ -339,12 +352,20 @@ app.post('/chat', requireAuth, async (req, res) => {
     .map(m => `${m.role === 'user' ? (profile?.name || 'User') : 'Coach'}: ${m.content}`).join('\n');
   runBackgroundJobs(req.userId, reply, transcript);
 
+  // Clear pending conflict now that it's been surfaced
+  if (profile?.pending_conflict) {
+    await supabase.from('profiles').update({ pending_conflict: null }).eq('id', req.userId);
+  }
+
   res.json({ reply });
 });
 
 // ── Background jobs ────────────────────────────────────────────────────────
 async function runBackgroundJobs(userId, reply, transcript) {
-  await Promise.allSettled([extractAndSaveMemory(userId, transcript), extractAndSaveRoutines(userId, reply)]);
+  await Promise.allSettled([
+    extractAndSaveMemory(userId, transcript),
+    extractAndSaveRoutines(userId, reply)
+  ]);
 }
 
 async function callClaude(prompt, maxTokens = 300) {
@@ -358,21 +379,71 @@ async function callClaude(prompt, maxTokens = 300) {
 }
 
 async function extractAndSaveMemory(userId, transcript) {
-  const prompt = `Extract NEW facts from this coaching conversation worth remembering about the user. Only genuinely new info.
-Examples: new PRs, injuries, diet changes, goal shifts, mood/energy, life context.
-JSON only: {"facts":["..."]} or {"facts":[]}. No preamble, no markdown.
+  // Load existing permanent memory for conflict detection
+  const { data: existingPermanent } = await supabase
+    .from('memory_permanent').select('*').eq('user_id', userId);
+  const permanentContext = (existingPermanent || [])
+    .map(m => `- [${m.category}] ${m.text}`).join('\n') || 'None yet';
+
+  const prompt = `Extract NEW facts from this coaching conversation worth remembering. Classify each as permanent or ephemeral.
+
+PERMANENT facts (injuries, goal shifts, training history, equipment, strong preferences — things that define the person long-term):
+- Return as: {"category": "injury|goal|history|equipment|preference", "text": "concise fact"}
+
+EPHEMERAL facts (mood, energy, recent sessions, temporary context — things that matter now but not forever):
+- Return as: {"text": "concise fact"}
+
+EXISTING PERMANENT MEMORY (for conflict detection):
+${permanentContext}
+
+CONFLICT DETECTION: If a new permanent fact contradicts an existing one, flag it.
+Example: existing says "goal: build muscle" but conversation reveals "started a cut" → flag this conflict.
+
+Return ONLY valid JSON:
+{
+  "permanent": [{"category": "...", "text": "..."}],
+  "ephemeral": [{"text": "..."}],
+  "conflicts": [{"existing": "existing fact text", "new": "new contradicting fact", "category": "category"}]
+}
+If nothing new: {"permanent": [], "ephemeral": [], "conflicts": []}
+No preamble, no markdown.
 
 TRANSCRIPT:
 ${transcript}`;
+
   try {
-    const raw = await callClaude(prompt, 300);
-    const { facts } = JSON.parse(raw);
-    if (facts?.length) {
-      const date = new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-      await supabase.from('memory_log').insert(facts.map(text => ({ user_id: userId, text, date })));
+    const raw = await callClaude(prompt, 500);
+    const parsed = JSON.parse(raw);
+    const date = new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+
+    // Save ephemeral facts
+    if (parsed.ephemeral?.length) {
+      await supabase.from('memory_log').insert(
+        parsed.ephemeral.map(f => ({ user_id: userId, text: f.text, date }))
+      );
       const { data: all } = await supabase.from('memory_log').select('id').eq('user_id', userId).order('created_at', { ascending: false });
       if (all && all.length > 40) await supabase.from('memory_log').delete().in('id', all.slice(40).map(r => r.id));
     }
+
+    // Save permanent facts (upsert by user_id + category + text)
+    if (parsed.permanent?.length) {
+      for (const fact of parsed.permanent) {
+        if (!fact.category || !fact.text) continue;
+        await supabase.from('memory_permanent')
+          .upsert(
+            { user_id: userId, category: fact.category, text: fact.text, updated_at: new Date().toISOString() },
+            { onConflict: 'user_id,category,text' }
+          );
+      }
+    }
+
+    // Store conflicts for next reply (save to a temp conflicts table via profile jsonb)
+    if (parsed.conflicts?.length) {
+      await supabase.from('profiles')
+        .update({ pending_conflict: JSON.stringify(parsed.conflicts[0]) })
+        .eq('id', userId);
+    }
+
   } catch(e) { console.error('Memory extraction error:', e); }
 }
 
@@ -412,47 +483,58 @@ ${reply}`;
 }
 
 // ── System prompt ──────────────────────────────────────────────────────────
-function buildSystemPrompt(profile, memory, routines, complianceStr = '') {
+function buildSystemPrompt(profile, memory, permanentMemory, routines, complianceStr = '') {
   if (!profile) return 'You are a personal coach. Ask the user to complete their profile setup.';
   const h = parseInt(profile.height), ft = Math.floor(h/12), inch = h%12;
-  const memBlock = memory.length ? '\nMEMORY LOG:\n' + memory.map(m => `- [${m.date}] ${m.text}`).join('\n') : '';
+  const CATEGORY_LABELS = { injury: 'Injury', goal: 'Goal', history: 'History', equipment: 'Equipment', preference: 'Preference' };
+
+  const permBlock = permanentMemory && permanentMemory.length
+    ? '\nPERMANENT CONTEXT:\n' + permanentMemory.map(m => '- [' + (CATEGORY_LABELS[m.category] || m.category) + '] ' + m.text).join('\n') : '';
+
+  const memBlock = memory.length
+    ? '\nRECENT OBSERVATIONS:\n' + memory.map(m => '- [' + m.date + '] ' + m.text).join('\n') : '';
+
   const routineBlock = Object.keys(routines).length
     ? '\nCURRENT ROUTINES:\n' + Object.entries(routines).map(([k,r]) =>
-        `${k.toUpperCase()} (updated ${r.updated_at}):\n` + r.sections.map(s => `  ${s.title}:\n${s.items.map(i => `    - ${i}`).join('\n')}`).join('\n')
+        k.toUpperCase() + ' (updated ' + r.updated_at + '):\n' + r.sections.map(s => '  ' + s.title + ':\n' + s.items.map(i => '    - ' + i).join('\n')).join('\n')
       ).join('\n\n') : '';
+
+  let conflictBlock = '';
+  if (profile.pending_conflict) {
+    try {
+      const c = typeof profile.pending_conflict === 'string'
+        ? JSON.parse(profile.pending_conflict) : profile.pending_conflict;
+      conflictBlock = '\nPENDING CONFLICT TO SURFACE: Before or after answering, naturally ask the user about this contradiction — keep it conversational, not like a system alert. Previously noted "' + c.existing + '" but recent conversation suggests "' + c.new + '". Ask if their ' + c.category + ' has changed.';
+    } catch(e) {}
+  }
 
   const now = new Date();
   const currentDate = now.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
 
-  return `You are a sharp, direct, and knowledgeable personal coach. NOT a generic AI — this person's dedicated coach with full context.
-
-TODAY: ${currentDate}
-
-USER PROFILE:
-- Name: ${profile.name} | Age: ${profile.age} | Sex: ${profile.sex}
-- Weight: ${profile.weight} lbs | Height: ${ft}′${inch}″
-- Goal: ${profile.goal} | Diet: ${profile.diet}
-- Injuries: ${profile.injuries} | Trains: ${profile.freq}/week
-- Notes: ${profile.notes || 'None'}
-${memBlock}${routineBlock}${complianceStr}
-
-APP FEATURES (you have access to these):
-- Routines tab: stores the user's workout, meal, and sleep plans — you can create and update these directly
-- Calendar tab: automatically populated from routines, shows daily planned items with completion tracking
-- When the user asks to save something to the calendar or schedule something, save it as a routine and it will appear in their calendar automatically
-- Never say you lack calendar access — you have full access through the routines system
-
-COACHING STYLE:
-- Direct and specific. No filler. No generic advice.
-- Always factor in profile, memory, and current routines.
-- Concise but substantive. Short paragraphs or brief lists.
-- Smart adult tone. No hand-holding.
-- Suggest next steps when relevant.
-
-BANNED PHRASES (never use):
-"I'll be honest", "Here's the reality", "Let's be real", "Real talk", "I have to say",
-"At the end of the day", "The truth is", "Look," as opener, any confession/revelation framing.
-Just say the thing. No wind-up.`;
+  return 'You are a sharp, direct, and knowledgeable personal coach. NOT a generic AI — this person's dedicated coach with full context.\n\n' +
+    'TODAY: ' + currentDate + '\n\n' +
+    'USER PROFILE:\n' +
+    '- Name: ' + profile.name + ' | Age: ' + profile.age + ' | Sex: ' + profile.sex + '\n' +
+    '- Weight: ' + profile.weight + ' lbs | Height: ' + ft + '\u2032' + inch + '\u2033\n' +
+    '- Goal: ' + profile.goal + ' | Diet: ' + profile.diet + '\n' +
+    '- Injuries: ' + profile.injuries + ' | Trains: ' + profile.freq + '/week\n' +
+    '- Notes: ' + (profile.notes || 'None') +
+    permBlock + memBlock + routineBlock + complianceStr + conflictBlock + '\n\n' +
+    'APP FEATURES (you have access to these):\n' +
+    '- Routines tab: stores the user's workout, meal, and sleep plans — you can create and update these directly\n' +
+    '- Calendar tab: automatically populated from routines, shows daily planned items with completion tracking\n' +
+    '- When the user asks to save something to the calendar or schedule something, save it as a routine and it will appear in their calendar automatically\n' +
+    '- Never say you lack calendar access — you have full access through the routines system\n\n' +
+    'COACHING STYLE:\n' +
+    '- Direct and specific. No filler. No generic advice.\n' +
+    '- Always factor in profile, permanent context, recent observations, and routines.\n' +
+    '- Concise but substantive. Short paragraphs or brief lists.\n' +
+    '- Smart adult tone. No hand-holding.\n' +
+    '- Suggest next steps when relevant.\n\n' +
+    'BANNED PHRASES (never use):\n' +
+    '"I'll be honest", "Here's the reality", "Let's be real", "Real talk", "I have to say",\n' +
+    '"At the end of the day", "The truth is", "Look," as opener, any confession/revelation framing.\n' +
+    'Just say the thing. No wind-up.';
 }
 
 
